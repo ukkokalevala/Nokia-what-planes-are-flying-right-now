@@ -1,0 +1,205 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_PCD8544.h>
+
+// --- WiFi Credentials ---
+const char* ssid = "YOUR_SSID";
+const char* password = "YOUR_PASSWORD";
+
+// --- Your Location (Cape Town) ---
+const float HOME_LAT = -33.9249;
+const float HOME_LON = 18.4241;
+const int SEARCH_RADIUS_NM = 30; // 30 Nautical Miles
+
+// --- ESP32-C3 Pins ---
+#define LCD_RST 9
+#define LCD_CE  8
+#define LCD_DC  7
+#define LCD_DIN 6
+#define LCD_CLK 4
+#define BUTTON_PIN 2
+
+Adafruit_PCD8544 display = Adafruit_PCD8544(LCD_CLK, LCD_DIN, LCD_DC, LCD_CE, LCD_RST);
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  display.begin();
+  display.setRotation(2);
+  display.setContrast(70); 
+  display.clearDisplay();
+  
+  display.setTextSize(1);
+  display.setTextColor(BLACK);
+  display.setCursor(0, 15);
+  display.println("Connecting to");
+  display.println("WiFi...");
+  display.display();
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
+
+  display.clearDisplay();
+  display.setCursor(0, 15);
+  display.println("WiFi OK!");
+  display.println("Press Button");
+  display.println("to Scan!");
+  display.display();
+}
+
+void loop() {
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    delay(50); // Debounce
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      fetchAndDisplayFlight();
+      while (digitalRead(BUTTON_PIN) == LOW) { delay(10); }
+      delay(50); 
+    }
+  }
+}
+
+void fetchAndDisplayFlight() {
+  display.clearDisplay();
+  display.setCursor(0, 15);
+  display.println("Scanning Sky...");
+  display.display();
+
+  HTTPClient http;
+  String url = "https://api.adsb.lol/v2/point/" + String(HOME_LAT, 4) + "/" + String(HOME_LON, 4) + "/" + String(SEARCH_RADIUS_NM);
+  
+  http.begin(url);
+  http.addHeader("User-Agent", "ESP32-FlightTracker/1.0");
+  int httpCode = http.GET();
+  
+  if (httpCode == 200) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(32768); 
+    DeserializationError error = deserializeJson(doc, payload);
+    
+    if (!error) {
+      JsonArray aircraft = doc["ac"];
+      
+      if (aircraft.isNull() || aircraft.size() == 0) {
+        showError("No planes found");
+        http.end();
+        return;
+      }
+
+      String validCallsign = "";
+      int validAltitude = 0;
+      String dep = "???";
+      String arr = "???";
+      bool foundCommercial = false;
+
+      // Check up to 10 planes to find a commercial flight
+      int planesToCheck = min((int)aircraft.size(), 10); 
+
+      for (int i = 0; i < planesToCheck; i++) {
+        JsonObject plane = aircraft[i];
+        String callsign = plane["flight"] | "UNKNOWN";
+        callsign.trim();
+        
+        // Skip unknown callsigns, but check everything else (including ZS/ZU)
+        if (callsign.length() < 3 || callsign.length() > 8 || callsign == "UNKNOWN") {
+          continue; 
+        }
+        
+        String routeUrl = "https://api.adsbdb.com/v0/callsign/" + callsign;
+        HTTPClient httpRoute;
+        httpRoute.begin(routeUrl);
+        httpRoute.setTimeout(2000); // 2 second timeout
+        int routeCode = httpRoute.GET();
+
+        if (routeCode == 200) {
+          String routePayload = httpRoute.getString();
+          DynamicJsonDocument routeDoc(8192);
+          deserializeJson(routeDoc, routePayload);
+          
+          JsonObject flightroute = routeDoc["response"]["flightroute"];
+          if (!flightroute.isNull()) {
+            validCallsign = callsign;
+            validAltitude = plane["alt_baro"] | 0;
+            dep = flightroute["origin"]["iata_code"] | "???";
+            arr = flightroute["destination"]["iata_code"] | "???";
+            foundCommercial = true;
+            httpRoute.end();
+            break; // Found one! Stop searching.
+          }
+        }
+        httpRoute.end();
+        delay(100); // Respect API limits
+      }
+
+      display.clearDisplay();
+      
+      if (foundCommercial) {
+        // We found a commercial flight
+        display.setTextSize(1);
+        display.setCursor(0, 0);
+        display.print("FLIGHT: ");
+        display.print(validCallsign);
+        
+        display.setTextSize(2);
+        display.setCursor(0, 12);
+        display.print(dep);
+        display.setTextSize(1);
+        display.setCursor(38, 18);
+        display.print(">");
+        display.setTextSize(2);
+        display.setCursor(48, 12);
+        display.print(arr);
+        
+        display.setTextSize(1);
+        display.setCursor(0, 36); // Fixed overlap
+        display.print("Alt: ");
+        display.print(validAltitude);
+        display.print(" ft");
+      } else {
+        // Only private planes found
+        JsonObject plane = aircraft[0];
+        String callsign = plane["flight"] | "UNKNOWN";
+        callsign.trim();
+        int altitude = plane["alt_baro"] | 0;
+        
+        display.setCursor(0, 0);
+        display.print("ONLY PRIVATE");
+        
+        display.setCursor(0, 12);
+        display.print("Near: ");
+        display.print(callsign);
+        
+        display.setCursor(0, 24);
+        display.print("No flight data");
+        
+        display.setCursor(0, 36); // Fixed overlap
+        display.print("Alt: ");
+        display.print(altitude);
+        display.print(" ft");
+      }
+      
+      display.display();
+      
+    } else {
+      showError("JSON Error");
+    }
+  } else {
+    showError("HTTP Err: " + String(httpCode));
+  }
+  http.end();
+}
+
+void showError(String msg) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 15);
+  display.println("Error:");
+  display.println(msg);
+  display.display();
+  delay(3000); 
+}
